@@ -1,0 +1,118 @@
+name: Salesforce CI/CD
+
+on:
+  push:
+    branches: [ main, develop ]
+  pull_request:
+    branches: [ main, develop ]
+
+jobs:
+  quality-check:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI and Scanner
+        run: |
+          npm install --global @salesforce/cli
+          sf plugins install @salesforce/sfdx-scanner
+
+      - name: Run Code Scanner
+        run: sf scanner run --target "force-app" --format table --severity-threshold 2
+
+  validate-pr:
+    needs: quality-check
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Authenticate Target Org
+        run: |
+          if [[ "${{ github.base_ref }}" == "main" ]]; then
+            if [ -z "${{ secrets.SFDX_AUTH_URL_PROD }}" ]; then
+              echo "❌ PROD org not configured. Validation aborted."
+              exit 1
+            fi
+            echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth_target.txt
+          else
+            if [ -z "${{ secrets.SFDX_AUTH_URL_DEV }}" ]; then
+              echo "❌ DEV org not configured. Validation aborted."
+              exit 1
+            fi
+            echo "${{ secrets.SFDX_AUTH_URL_DEV }}" > auth_target.txt
+          fi
+
+          sf org login sfdx-url --sfdx-url-file auth_target.txt --set-default --alias TARGET_ORG
+          rm auth_target.txt
+
+      - name: Validate Deployment (Check Only)
+        run: |
+          sf project deploy validate \
+            --source-dir force-app \
+            --target-org TARGET_ORG \
+            --test-level RunLocalTests
+
+  deploy-dev:
+    needs: quality-check
+    if: >
+      github.ref == 'refs/heads/develop' &&
+      github.event_name == 'push' &&
+      secrets.SFDX_AUTH_URL_DEV != ''
+    runs-on: ubuntu-latest
+    environment: development
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Authenticate Dev Org
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL_DEV }}" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --set-default
+          rm auth.txt
+
+      - name: Deploy to Dev
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --test-level RunLocalTests
+
+      - name: Dev deploy skipped (info)
+        if: secrets.SFDX_AUTH_URL_DEV == ''
+        run: echo "ℹ️ DEV org not configured. Deployment skipped."
+
+  deploy-prod:
+    needs: quality-check
+    if: >
+      github.ref == 'refs/heads/main' &&
+      github.event_name == 'push' &&
+      secrets.SFDX_AUTH_URL_PROD != ''
+    runs-on: ubuntu-latest
+    environment: production
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Authenticate Production Org
+        run: |
+          echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth.txt
+          sf org login sfdx-url --sfdx-url-file auth.txt --set-default
+          rm auth.txt
+
+      - name: Deploy to Production
+        run: |
+          sf project deploy start \
+            --source-dir force-app \
+            --test-level RunLocalTests
+
+      - name: Prod deploy skipped (info)
+        if: secrets.SFDX_AUTH_URL_PROD == ''
+        run: echo "ℹ️ PROD org not configured. Deployment skipped."
+
