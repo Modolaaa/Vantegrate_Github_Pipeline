@@ -7,10 +7,30 @@ on:
     branches: [ main, develop ]
 
 jobs:
+# JOB 1: Escaneo de Código (Con Caché)
   quality-check:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+
+      # PASO NUEVO: Configurar Node.js + Caché simple
+      - name: Setup Node
+        uses: actions/setup-node@v4
+        with:
+          node-version: '20'
+          cache: 'npm' # Esto le dice a GitHub: "Guarda lo que bajes de NPM"
+
+      # PASO NUEVO: Caché manual para el Scanner (que es lo más pesado)
+      - name: Cache SFDX Scanner dependencies
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.npm
+            ~/.local/share/sfdx
+            ~/.cache/sfdx
+          key: ${{ runner.os }}-sfdx-scanner-${{ hashFiles('**/package-lock.json') }}
+          restore-keys: |
+            ${{ runner.os }}-sfdx-scanner-
 
       - name: Install Salesforce CLI and Scanner
         run: |
@@ -115,4 +135,3 @@ jobs:
       - name: Prod deploy skipped (info)
         if: secrets.SFDX_AUTH_URL_PROD == ''
         run: echo "ℹ️ PROD org not configured. Deployment skipped."
-
