@@ -278,8 +278,8 @@ Write-Host ""
 Write-Host "  ⚠️  PRÓXIMOS PASOS:" -ForegroundColor Yellow
 Write-Host "     1. Configurar secreto SFDX_AUTH_URL_DEV en GitHub" -ForegroundColor Gray
 Write-Host "     2. Configurar secreto SFDX_AUTH_URL_PROD en GitHub" -ForegroundColor Gray
-Write-Host "     3. Crear environment 'production' con reviewers" -ForegroundColor Gray
+Write-Host '     3. Crear environment "production" con reviewers' -ForegroundColor Gray
 Write-Host ""
 Write-Host "  📖 Para obtener el SFDX Auth URL, ejecuta:" -ForegroundColor Cyan
-Write-Host "     sf org display --verbose --target-org TU_ORG | grep 'Sfdx Auth Url'" -ForegroundColor Gray
+Write-Host '     sf org display --verbose --target-org TU_ORG | grep "Sfdx Auth Url"' -ForegroundColor Gray
 Write-Host ""
