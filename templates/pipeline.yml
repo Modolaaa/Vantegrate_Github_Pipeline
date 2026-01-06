@@ -2,117 +2,268 @@ name: Salesforce CI/CD
 
 on:
   push:
-    branches: [ main, develop ]
+    branches: [main, develop]
   pull_request:
-    branches: [ main, develop ]
+    branches: [main, develop]
+
+# Permisos explícitos para que GitHub Actions pueda reportar status checks
+permissions:
+  contents: read
+  pull-requests: read
+  statuses: write
+  checks: write
 
 jobs:
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 1: Quality Check - Escaneo de código con Salesforce Code Scanner
+  # ═══════════════════════════════════════════════════════════════════════════
   quality-check:
+    name: "Quality Check"
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
-      - name: Install Salesforce CLI and Scanner
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache Salesforce CLI and Scanner
+        uses: actions/cache@v4
+        id: sfdx-cache
+        with:
+          path: |
+            ~/.npm
+            ~/.local/share/sf
+            ~/.cache/sf
+          key: ${{ runner.os }}-sfdx-cli-scanner-v3
+          restore-keys: |
+            ${{ runner.os }}-sfdx-cli-scanner-
+
+      - name: Install Salesforce CLI
+        run: npm install --global @salesforce/cli
+
+      - name: Install SFDX Scanner Plugin
+        run: sf plugins install @salesforce/sfdx-scanner
+
+      - name: Verify force-app exists
         run: |
-          npm install --global @salesforce/cli
-          sf plugins install @salesforce/sfdx-scanner
+          if [ ! -d "force-app" ]; then
+            echo "⚠️ force-app directory not found. Creating minimal structure for initial setup..."
+            mkdir -p force-app/main/default/classes
+            echo "/* Placeholder */" > force-app/main/default/classes/.gitkeep
+          fi
 
       - name: Run Code Scanner
-        run: sf scanner run --target "force-app" --format table --severity-threshold 2
+        run: |
+          sf scanner run \
+            --target "force-app" \
+            --format table \
+            --severity-threshold 2 \
+            --normalize-severity
+        continue-on-error: false
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 2: Validate PR - Validación contra org destino (sin deploy)
+  # ═══════════════════════════════════════════════════════════════════════════
   validate-pr:
+    name: "Validate PR"
     needs: quality-check
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Cache Salesforce CLI
+        uses: actions/cache@v4
+        with:
+          path: ~/.npm
+          key: ${{ runner.os }}-node-sf-cli
+          restore-keys: |
+            ${{ runner.os }}-node-
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
-      - name: Authenticate Target Org
+      - name: Determine Target Org
+        id: target-org
         run: |
           if [[ "${{ github.base_ref }}" == "main" ]]; then
-            if [ -z "${{ secrets.SFDX_AUTH_URL_PROD }}" ]; then
-              echo "❌ PROD org not configured. Validation aborted."
-              exit 1
-            fi
-            echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth_target.txt
+            echo "org_type=PROD" >> $GITHUB_OUTPUT
+            echo "secret_name=SFDX_AUTH_URL_PROD" >> $GITHUB_OUTPUT
           else
-            if [ -z "${{ secrets.SFDX_AUTH_URL_DEV }}" ]; then
-              echo "❌ DEV org not configured. Validation aborted."
-              exit 1
-            fi
-            echo "${{ secrets.SFDX_AUTH_URL_DEV }}" > auth_target.txt
+            echo "org_type=DEV" >> $GITHUB_OUTPUT
+            echo "secret_name=SFDX_AUTH_URL_DEV" >> $GITHUB_OUTPUT
           fi
 
+      - name: Check Org Credentials Available
+        id: check-creds
+        env:
+          SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
+          SFDX_AUTH_URL_PROD: ${{ secrets.SFDX_AUTH_URL_PROD }}
+        run: |
+          if [[ "${{ steps.target-org.outputs.org_type }}" == "PROD" ]]; then
+            if [ -z "$SFDX_AUTH_URL_PROD" ]; then
+              echo "⚠️ PROD org credentials not configured yet."
+              echo "creds_available=false" >> $GITHUB_OUTPUT
+            else
+              echo "creds_available=true" >> $GITHUB_OUTPUT
+            fi
+          else
+            if [ -z "$SFDX_AUTH_URL_DEV" ]; then
+              echo "⚠️ DEV org credentials not configured yet."
+              echo "creds_available=false" >> $GITHUB_OUTPUT
+            else
+              echo "creds_available=true" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Authenticate to Target Org
+        if: steps.check-creds.outputs.creds_available == 'true'
+        env:
+          SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
+          SFDX_AUTH_URL_PROD: ${{ secrets.SFDX_AUTH_URL_PROD }}
+        run: |
+          if [[ "${{ steps.target-org.outputs.org_type }}" == "PROD" ]]; then
+            echo "$SFDX_AUTH_URL_PROD" > auth_target.txt
+          else
+            echo "$SFDX_AUTH_URL_DEV" > auth_target.txt
+          fi
           sf org login sfdx-url --sfdx-url-file auth_target.txt --set-default --alias TARGET_ORG
-          rm auth_target.txt
+          rm -f auth_target.txt
 
       - name: Validate Deployment (Check Only)
+        if: steps.check-creds.outputs.creds_available == 'true'
         run: |
+          echo "🔍 Validating deployment against ${{ steps.target-org.outputs.org_type }} org..."
           sf project deploy validate \
             --source-dir force-app \
             --target-org TARGET_ORG \
-            --test-level RunLocalTests
+            --test-level RunLocalTests \
+            --wait 30
 
+      - name: Skip Validation (No Credentials)
+        if: steps.check-creds.outputs.creds_available == 'false'
+        run: |
+          echo "ℹ️ Org validation skipped - credentials not configured."
+          echo "Configure ${{ steps.target-org.outputs.secret_name }} secret to enable validation."
+          echo "Quality check passed. PR can proceed."
+
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 3: Deploy to Development - Auto-deploy on develop branch
+  # ═══════════════════════════════════════════════════════════════════════════
   deploy-dev:
+    name: "Deploy to DEV"
     needs: quality-check
-    if: >
-      github.ref == 'refs/heads/develop' &&
-      github.event_name == 'push' &&
-      secrets.SFDX_AUTH_URL_DEV != ''
+    if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: development
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
-      - name: Authenticate Dev Org
+      - name: Check DEV Credentials
+        id: check-dev-creds
+        env:
+          SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL_DEV }}" > auth.txt
+          if [ -z "$SFDX_AUTH_URL_DEV" ]; then
+            echo "available=false" >> $GITHUB_OUTPUT
+          else
+            echo "available=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Authenticate Dev Org
+        if: steps.check-dev-creds.outputs.available == 'true'
+        env:
+          SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
+        run: |
+          echo "$SFDX_AUTH_URL_DEV" > auth.txt
           sf org login sfdx-url --sfdx-url-file auth.txt --set-default
-          rm auth.txt
+          rm -f auth.txt
 
       - name: Deploy to Dev
+        if: steps.check-dev-creds.outputs.available == 'true'
         run: |
+          echo "🚀 Deploying to DEV org..."
           sf project deploy start \
             --source-dir force-app \
-            --test-level RunLocalTests
+            --test-level RunLocalTests \
+            --wait 30
 
-      - name: Dev deploy skipped (info)
-        if: secrets.SFDX_AUTH_URL_DEV == ''
-        run: echo "ℹ️ DEV org not configured. Deployment skipped."
+      - name: Deployment Skipped
+        if: steps.check-dev-creds.outputs.available == 'false'
+        run: |
+          echo "ℹ️ DEV deployment skipped - SFDX_AUTH_URL_DEV not configured."
 
+  # ═══════════════════════════════════════════════════════════════════════════
+  # JOB 4: Deploy to Production - Requires manual approval
+  # ═══════════════════════════════════════════════════════════════════════════
   deploy-prod:
+    name: "Deploy to PROD"
     needs: quality-check
-    if: >
-      github.ref == 'refs/heads/main' &&
-      github.event_name == 'push' &&
-      secrets.SFDX_AUTH_URL_PROD != ''
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
     runs-on: ubuntu-latest
     environment: production
     steps:
-      - uses: actions/checkout@v4
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
-      - name: Authenticate Production Org
+      - name: Check PROD Credentials
+        id: check-prod-creds
+        env:
+          SFDX_AUTH_URL_PROD: ${{ secrets.SFDX_AUTH_URL_PROD }}
         run: |
-          echo "${{ secrets.SFDX_AUTH_URL_PROD }}" > auth.txt
+          if [ -z "$SFDX_AUTH_URL_PROD" ]; then
+            echo "available=false" >> $GITHUB_OUTPUT
+          else
+            echo "available=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Authenticate Production Org
+        if: steps.check-prod-creds.outputs.available == 'true'
+        env:
+          SFDX_AUTH_URL_PROD: ${{ secrets.SFDX_AUTH_URL_PROD }}
+        run: |
+          echo "$SFDX_AUTH_URL_PROD" > auth.txt
           sf org login sfdx-url --sfdx-url-file auth.txt --set-default
-          rm auth.txt
+          rm -f auth.txt
 
       - name: Deploy to Production
+        if: steps.check-prod-creds.outputs.available == 'true'
         run: |
+          echo "🚀 Deploying to PRODUCTION org..."
           sf project deploy start \
             --source-dir force-app \
-            --test-level RunLocalTests
+            --test-level RunLocalTests \
+            --wait 30
 
-      - name: Prod deploy skipped (info)
-        if: secrets.SFDX_AUTH_URL_PROD == ''
-        run: echo "ℹ️ PROD org not configured. Deployment skipped."
-
+      - name: Deployment Skipped
+        if: steps.check-prod-creds.outputs.available == 'false'
+        run: |
+          echo "ℹ️ PROD deployment skipped - SFDX_AUTH_URL_PROD not configured."
