@@ -203,7 +203,7 @@ Write-Step "Configurando ramas..."
 
 git checkout -b develop --quiet
 git push -u origin develop --quiet 2>$null
-git checkout main --quiet
+git checkout master --quiet
 
 Write-Success "Rama develop creada y publicada."
 
@@ -254,8 +254,8 @@ $protectionPayload = @{
     allow_deletions                = $false
 } | ConvertTo-Json -Depth 10
 
-$protectionPayload | gh api "repos/:owner/$ProjectName/branches/main/protection" --method PUT --input - 2>$null | Out-Null
-Write-Success "Proteccion aplicada a main."
+$protectionPayload | gh api "repos/:owner/$ProjectName/branches/master/protection" --method PUT --input - 2>$null | Out-Null
+Write-Success "Proteccion aplicada a master."
 
 $protectionPayload | gh api "repos/:owner/$ProjectName/branches/develop/protection" --method PUT --input - 2>$null | Out-Null
 Write-Success "Proteccion aplicada a develop."
