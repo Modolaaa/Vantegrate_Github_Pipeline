@@ -62,7 +62,7 @@ jobs:
           sf scanner run \
             --target "force-app" \
             --format table \
-            --severity-threshold 2 \
+            --severity-threshold 1 \
             --normalize-severity
         continue-on-error: false
 
