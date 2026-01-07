@@ -4,7 +4,7 @@ param(
 )
 
 # VANTEGRATE - Salesforce Project Generator with CI/CD Pipeline
-# Version: 2.0.0
+# Version: 2.1.0
 
 # --- CONFIGURACION ---
 $Collaborators = @()
@@ -35,45 +35,52 @@ function Write-Info {
 
 function Wait-ForWorkflowCompletion {
     param(
-        [string]$RepoName,
         [int]$TimeoutSeconds = 300
     )
     
     Write-Info "Esperando que el workflow inicial complete..."
     
     $startTime = Get-Date
-    $workflowCompleted = $false
     
-    while (-not $workflowCompleted) {
+    while ($true) {
         $elapsed = ((Get-Date) - $startTime).TotalSeconds
         
         if ($elapsed -gt $TimeoutSeconds) {
-            Write-Warning "Timeout alcanzado. El workflow puede seguir ejecutandose."
+            Write-Warning "Timeout alcanzado despues de $TimeoutSeconds segundos."
             return $false
         }
         
-        $runsJson = gh run list --repo ":owner/$RepoName" --limit 1 --json status,conclusion 2>$null
+        # Ejecutar desde el directorio del repo, sin necesidad de --repo flag
+        $runsJson = gh run list --limit 1 --json status,conclusion 2>$null
         
         if ($runsJson) {
             $runs = $runsJson | ConvertFrom-Json
             
             if ($runs.Count -gt 0) {
                 $latestRun = $runs[0]
+                $status = $latestRun.status
+                $conclusion = $latestRun.conclusion
                 
-                if ($latestRun.status -eq "completed") {
-                    if ($latestRun.conclusion -eq "success") {
-                        Write-Success "Workflow inicial completado exitosamente."
+                Write-Host "." -NoNewline -ForegroundColor Gray
+                
+                if ($status -eq "completed") {
+                    Write-Host ""
+                    if ($conclusion -eq "success") {
+                        Write-Success "Workflow completado exitosamente."
                         return $true
                     }
                     else {
-                        Write-Warning "Workflow completo con estado: $($latestRun.conclusion)"
+                        Write-Warning "Workflow completo con estado: $conclusion"
                         return $true
                     }
                 }
-                else {
-                    Write-Host "." -NoNewline -ForegroundColor Gray
-                }
             }
+            else {
+                Write-Host "x" -NoNewline -ForegroundColor Yellow
+            }
+        }
+        else {
+            Write-Host "?" -NoNewline -ForegroundColor Yellow
         }
         
         Start-Sleep -Seconds 10
@@ -218,12 +225,13 @@ if ($Collaborators.Count -gt 0) {
 Write-Step "Esperando ejecucion inicial del workflow..."
 Write-Info "Esto es necesario para que GitHub reconozca los status checks."
 
-Start-Sleep -Seconds 5
+Start-Sleep -Seconds 10
 
-$workflowSuccess = Wait-ForWorkflowCompletion -RepoName $ProjectName -TimeoutSeconds $WaitForWorkflowTimeout
+$workflowSuccess = Wait-ForWorkflowCompletion -TimeoutSeconds $WaitForWorkflowTimeout
 
 if (-not $workflowSuccess) {
     Write-Warning "No se pudo confirmar la ejecucion del workflow."
+    Write-Info "Continua con la configuracion de todas formas..."
 }
 
 # =============================================================================
