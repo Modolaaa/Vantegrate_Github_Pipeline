@@ -6,19 +6,24 @@ on:
   pull_request:
     branches: [master, develop]
 
-# Permisos explícitos para que GitHub Actions pueda reportar status checks
 permissions:
   contents: read
   pull-requests: read
   statuses: write
   checks: write
 
+env:
+  # Configuracion de Delta Deployments
+  DELTA_ENABLED: true
+  # Directorio donde se genera el paquete delta
+  DELTA_OUTPUT: delta-package
+
 jobs:
   # ═══════════════════════════════════════════════════════════════════════════
   # JOB 1: Quality Check - Escaneo de código con Salesforce Code Scanner
   # ═══════════════════════════════════════════════════════════════════════════
   quality-check:
-    name: "Quality Check"
+    name: Quality Check
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
@@ -29,7 +34,7 @@ jobs:
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
       - name: Cache Salesforce CLI and Scanner
         uses: actions/cache@v4
@@ -52,9 +57,9 @@ jobs:
       - name: Verify force-app exists
         run: |
           if [ ! -d "force-app" ]; then
-            echo "⚠️ force-app directory not found. Creating minimal structure for initial setup..."
-            mkdir -p force-app/master/default/classes
-            echo "/* Placeholder */" > force-app/master/default/classes/.gitkeep
+            echo "⚠️ force-app directory not found. Creating minimal structure..."
+            mkdir -p force-app/main/default/classes
+            echo "/* Placeholder */" > force-app/main/default/classes/.gitkeep
           fi
 
       - name: Run Code Scanner
@@ -62,37 +67,36 @@ jobs:
           sf scanner run \
             --target "force-app" \
             --format table \
-            --severity-threshold 1 \
+            --severity-threshold 2 \
             --normalize-severity
         continue-on-error: false
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 2: Validate PR - Validación contra org destino (sin deploy)
+  # JOB 2: Validate PR - Validación con Delta contra org destino
   # ═══════════════════════════════════════════════════════════════════════════
   validate-pr:
-    name: "Validate PR"
+    name: Validate PR
     needs: quality-check
     if: github.event_name == 'pull_request'
     runs-on: ubuntu-latest
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
-
-      - name: Cache Salesforce CLI
-        uses: actions/cache@v4
-        with:
-          path: ~/.npm
-          key: ${{ runner.os }}-node-sf-cli
-          restore-keys: |
-            ${{ runner.os }}-node-
+          node-version: 20
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
+
+      - name: Install sfdx-git-delta
+        run: |
+          echo "📦 Instalando sfdx-git-delta..."
+          echo y | sf plugins install sfdx-git-delta
 
       - name: Determine Target Org
         id: target-org
@@ -105,7 +109,7 @@ jobs:
             echo "secret_name=SFDX_AUTH_URL_DEV" >> $GITHUB_OUTPUT
           fi
 
-      - name: Check Org Credentials Available
+      - name: Check Org Credentials
         id: check-creds
         env:
           SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
@@ -113,14 +117,14 @@ jobs:
         run: |
           if [[ "${{ steps.target-org.outputs.org_type }}" == "PROD" ]]; then
             if [ -z "$SFDX_AUTH_URL_PROD" ]; then
-              echo "⚠️ PROD org credentials not configured yet."
+              echo "⚠️ PROD credentials not configured"
               echo "creds_available=false" >> $GITHUB_OUTPUT
             else
               echo "creds_available=true" >> $GITHUB_OUTPUT
             fi
           else
             if [ -z "$SFDX_AUTH_URL_DEV" ]; then
-              echo "⚠️ DEV org credentials not configured yet."
+              echo "⚠️ DEV credentials not configured"
               echo "creds_available=false" >> $GITHUB_OUTPUT
             else
               echo "creds_available=true" >> $GITHUB_OUTPUT
@@ -141,10 +145,69 @@ jobs:
           sf org login sfdx-url --sfdx-url-file auth_target.txt --set-default --alias TARGET_ORG
           rm -f auth_target.txt
 
-      - name: Validate Deployment (Check Only)
+      - name: Generate Delta Package
         if: steps.check-creds.outputs.creds_available == 'true'
+        id: delta
         run: |
-          echo "🔍 Validating deployment against ${{ steps.target-org.outputs.org_type }} org..."
+          echo "📊 Generando paquete delta..."
+          
+          # Obtener el commit base del PR
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
+          HEAD_SHA="${{ github.event.pull_request.head.sha }}"
+          
+          echo "Base: $BASE_SHA"
+          echo "Head: $HEAD_SHA"
+          
+          # Crear directorio para el delta
+          mkdir -p ${{ env.DELTA_OUTPUT }}
+          
+          # Generar delta package
+          sf sgd source delta \
+            --from "$BASE_SHA" \
+            --to "$HEAD_SHA" \
+            --output ${{ env.DELTA_OUTPUT }} \
+            --generate-delta
+          
+          # Verificar si hay cambios
+          if [ -d "${{ env.DELTA_OUTPUT }}/force-app" ]; then
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+            echo "✅ Cambios detectados:"
+            find ${{ env.DELTA_OUTPUT }}/force-app -type f | head -20
+            
+            CHANGE_COUNT=$(find ${{ env.DELTA_OUTPUT }}/force-app -type f | wc -l)
+            echo "📁 Total archivos modificados: $CHANGE_COUNT"
+          else
+            echo "has_changes=false" >> $GITHUB_OUTPUT
+            echo "ℹ️ No hay cambios en force-app"
+          fi
+          
+          # Verificar si hay destructive changes
+          if [ -f "${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml" ]; then
+            echo "has_destructive=true" >> $GITHUB_OUTPUT
+            echo "⚠️ Hay componentes a eliminar:"
+            cat ${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml
+          else
+            echo "has_destructive=false" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Validate Delta Deployment
+        if: steps.check-creds.outputs.creds_available == 'true' && steps.delta.outputs.has_changes == 'true'
+        run: |
+          echo "🔍 Validando deployment delta contra ${{ steps.target-org.outputs.org_type }}..."
+          
+          DEPLOY_ARGS="--source-dir ${{ env.DELTA_OUTPUT }}/force-app --target-org TARGET_ORG --test-level RunLocalTests --wait 30"
+          
+          # Agregar destructive changes si existen
+          if [ "${{ steps.delta.outputs.has_destructive }}" == "true" ]; then
+            DEPLOY_ARGS="$DEPLOY_ARGS --post-destructive-changes ${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml"
+          fi
+          
+          sf project deploy validate $DEPLOY_ARGS
+
+      - name: Validate Full Deployment (No Delta Changes)
+        if: steps.check-creds.outputs.creds_available == 'true' && steps.delta.outputs.has_changes == 'false'
+        run: |
+          echo "ℹ️ No hay cambios delta, validando force-app completo..."
           sf project deploy validate \
             --source-dir force-app \
             --target-org TARGET_ORG \
@@ -154,15 +217,14 @@ jobs:
       - name: Skip Validation (No Credentials)
         if: steps.check-creds.outputs.creds_available == 'false'
         run: |
-          echo "ℹ️ Org validation skipped - credentials not configured."
-          echo "Configure ${{ steps.target-org.outputs.secret_name }} secret to enable validation."
-          echo "Quality check passed. PR can proceed."
+          echo "ℹ️ Validation skipped - credentials not configured"
+          echo "Configure ${{ steps.target-org.outputs.secret_name }} secret to enable validation"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 3: Deploy to Development - Auto-deploy on develop branch
+  # JOB 3: Deploy to Development - Delta deploy on develop branch
   # ═══════════════════════════════════════════════════════════════════════════
   deploy-dev:
-    name: "Deploy to DEV"
+    name: Deploy to DEV
     needs: quality-check
     if: github.ref == 'refs/heads/develop' && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -170,17 +232,24 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
+      - name: Install sfdx-git-delta
+        run: |
+          echo "📦 Instalando sfdx-git-delta..."
+          echo y | sf plugins install sfdx-git-delta
+
       - name: Check DEV Credentials
-        id: check-dev-creds
+        id: check-creds
         env:
           SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
         run: |
@@ -191,33 +260,104 @@ jobs:
           fi
 
       - name: Authenticate Dev Org
-        if: steps.check-dev-creds.outputs.available == 'true'
+        if: steps.check-creds.outputs.available == 'true'
         env:
           SFDX_AUTH_URL_DEV: ${{ secrets.SFDX_AUTH_URL_DEV }}
         run: |
           echo "$SFDX_AUTH_URL_DEV" > auth.txt
-          sf org login sfdx-url --sfdx-url-file auth.txt --set-default
+          sf org login sfdx-url --sfdx-url-file auth.txt --set-default --alias DEV_ORG
           rm -f auth.txt
 
-      - name: Deploy to Dev
-        if: steps.check-dev-creds.outputs.available == 'true'
+      - name: Generate Delta Package
+        if: steps.check-creds.outputs.available == 'true'
+        id: delta
         run: |
-          echo "🚀 Deploying to DEV org..."
+          echo "📊 Generando paquete delta..."
+          
+          # Obtener el commit anterior
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+          
+          echo "Before: $BEFORE_SHA"
+          echo "After: $AFTER_SHA"
+          
+          # Crear directorio para el delta
+          mkdir -p ${{ env.DELTA_OUTPUT }}
+          
+          # Manejar caso de primer push (before = 0000000)
+          if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "⚠️ Primer push detectado, deployando todo force-app"
+            echo "is_first_push=true" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            # Generar delta package
+            sf sgd source delta \
+              --from "$BEFORE_SHA" \
+              --to "$AFTER_SHA" \
+              --output ${{ env.DELTA_OUTPUT }} \
+              --generate-delta
+            
+            echo "is_first_push=false" >> $GITHUB_OUTPUT
+            
+            if [ -d "${{ env.DELTA_OUTPUT }}/force-app" ]; then
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "✅ Cambios detectados:"
+              find ${{ env.DELTA_OUTPUT }}/force-app -type f | head -20
+              
+              CHANGE_COUNT=$(find ${{ env.DELTA_OUTPUT }}/force-app -type f | wc -l)
+              echo "📁 Total archivos a deployar: $CHANGE_COUNT"
+            else
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo "ℹ️ No hay cambios en force-app"
+            fi
+            
+            if [ -f "${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml" ]; then
+              echo "has_destructive=true" >> $GITHUB_OUTPUT
+              echo "⚠️ Componentes a eliminar:"
+              cat ${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml
+            else
+              echo "has_destructive=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Deploy Delta to Dev
+        if: steps.check-creds.outputs.available == 'true' && steps.delta.outputs.has_changes == 'true' && steps.delta.outputs.is_first_push == 'false'
+        run: |
+          echo "🚀 Deployando delta a DEV..."
+          
+          DEPLOY_ARGS="--source-dir ${{ env.DELTA_OUTPUT }}/force-app --target-org DEV_ORG --test-level RunLocalTests --wait 30"
+          
+          if [ "${{ steps.delta.outputs.has_destructive }}" == "true" ]; then
+            DEPLOY_ARGS="$DEPLOY_ARGS --post-destructive-changes ${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml"
+          fi
+          
+          sf project deploy start $DEPLOY_ARGS
+
+      - name: Deploy Full to Dev (First Push)
+        if: steps.check-creds.outputs.available == 'true' && steps.delta.outputs.is_first_push == 'true'
+        run: |
+          echo "🚀 Primer push - Deployando force-app completo a DEV..."
           sf project deploy start \
             --source-dir force-app \
+            --target-org DEV_ORG \
             --test-level RunLocalTests \
             --wait 30
 
-      - name: Deployment Skipped
-        if: steps.check-dev-creds.outputs.available == 'false'
+      - name: No Changes to Deploy
+        if: steps.check-creds.outputs.available == 'true' && steps.delta.outputs.has_changes == 'false'
         run: |
-          echo "ℹ️ DEV deployment skipped - SFDX_AUTH_URL_DEV not configured."
+          echo "ℹ️ No hay cambios en force-app para deployar"
+
+      - name: Deployment Skipped
+        if: steps.check-creds.outputs.available == 'false'
+        run: |
+          echo "ℹ️ DEV deployment skipped - SFDX_AUTH_URL_DEV not configured"
 
   # ═══════════════════════════════════════════════════════════════════════════
-  # JOB 4: Deploy to Production - Requires manual approval
+  # JOB 4: Deploy to Production - Delta deploy with approval
   # ═══════════════════════════════════════════════════════════════════════════
   deploy-prod:
-    name: "Deploy to PROD"
+    name: Deploy to PROD
     needs: quality-check
     if: github.ref == 'refs/heads/master' && github.event_name == 'push'
     runs-on: ubuntu-latest
@@ -225,17 +365,24 @@ jobs:
     steps:
       - name: Checkout code
         uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
 
       - name: Setup Node.js
         uses: actions/setup-node@v4
         with:
-          node-version: "20"
+          node-version: 20
 
       - name: Install Salesforce CLI
         run: npm install --global @salesforce/cli
 
+      - name: Install sfdx-git-delta
+        run: |
+          echo "📦 Instalando sfdx-git-delta..."
+          echo y | sf plugins install sfdx-git-delta
+
       - name: Check PROD Credentials
-        id: check-prod-creds
+        id: check-creds
         env:
           SFDX_AUTH_URL_PROD: ${{ secrets.SFDX_AUTH_URL_PROD }}
         run: |
@@ -246,24 +393,91 @@ jobs:
           fi
 
       - name: Authenticate Production Org
-        if: steps.check-prod-creds.outputs.available == 'true'
+        if: steps.check-creds.outputs.available == 'true'
         env:
           SFDX_AUTH_URL_PROD: ${{ secrets.SFDX_AUTH_URL_PROD }}
         run: |
           echo "$SFDX_AUTH_URL_PROD" > auth.txt
-          sf org login sfdx-url --sfdx-url-file auth.txt --set-default
+          sf org login sfdx-url --sfdx-url-file auth.txt --set-default --alias PROD_ORG
           rm -f auth.txt
 
-      - name: Deploy to Production
-        if: steps.check-prod-creds.outputs.available == 'true'
+      - name: Generate Delta Package
+        if: steps.check-creds.outputs.available == 'true'
+        id: delta
         run: |
-          echo "🚀 Deploying to PRODUCTION org..."
+          echo "📊 Generando paquete delta..."
+          
+          BEFORE_SHA="${{ github.event.before }}"
+          AFTER_SHA="${{ github.sha }}"
+          
+          echo "Before: $BEFORE_SHA"
+          echo "After: $AFTER_SHA"
+          
+          mkdir -p ${{ env.DELTA_OUTPUT }}
+          
+          if [[ "$BEFORE_SHA" == "0000000000000000000000000000000000000000" ]]; then
+            echo "⚠️ Primer push detectado, deployando todo force-app"
+            echo "is_first_push=true" >> $GITHUB_OUTPUT
+            echo "has_changes=true" >> $GITHUB_OUTPUT
+          else
+            sf sgd source delta \
+              --from "$BEFORE_SHA" \
+              --to "$AFTER_SHA" \
+              --output ${{ env.DELTA_OUTPUT }} \
+              --generate-delta
+            
+            echo "is_first_push=false" >> $GITHUB_OUTPUT
+            
+            if [ -d "${{ env.DELTA_OUTPUT }}/force-app" ]; then
+              echo "has_changes=true" >> $GITHUB_OUTPUT
+              echo "✅ Cambios detectados:"
+              find ${{ env.DELTA_OUTPUT }}/force-app -type f | head -20
+              
+              CHANGE_COUNT=$(find ${{ env.DELTA_OUTPUT }}/force-app -type f | wc -l)
+              echo "📁 Total archivos a deployar: $CHANGE_COUNT"
+            else
+              echo "has_changes=false" >> $GITHUB_OUTPUT
+              echo "ℹ️ No hay cambios en force-app"
+            fi
+            
+            if [ -f "${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml" ]; then
+              echo "has_destructive=true" >> $GITHUB_OUTPUT
+              echo "⚠️ Componentes a eliminar:"
+              cat ${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml
+            else
+              echo "has_destructive=false" >> $GITHUB_OUTPUT
+            fi
+          fi
+
+      - name: Deploy Delta to Production
+        if: steps.check-creds.outputs.available == 'true' && steps.delta.outputs.has_changes == 'true' && steps.delta.outputs.is_first_push == 'false'
+        run: |
+          echo "🚀 Deployando delta a PRODUCCION..."
+          
+          DEPLOY_ARGS="--source-dir ${{ env.DELTA_OUTPUT }}/force-app --target-org PROD_ORG --test-level RunLocalTests --wait 30"
+          
+          if [ "${{ steps.delta.outputs.has_destructive }}" == "true" ]; then
+            DEPLOY_ARGS="$DEPLOY_ARGS --post-destructive-changes ${{ env.DELTA_OUTPUT }}/destructiveChanges/destructiveChanges.xml"
+          fi
+          
+          sf project deploy start $DEPLOY_ARGS
+
+      - name: Deploy Full to Production (First Push)
+        if: steps.check-creds.outputs.available == 'true' && steps.delta.outputs.is_first_push == 'true'
+        run: |
+          echo "🚀 Primer push - Deployando force-app completo a PRODUCCION..."
           sf project deploy start \
             --source-dir force-app \
+            --target-org PROD_ORG \
             --test-level RunLocalTests \
             --wait 30
 
-      - name: Deployment Skipped
-        if: steps.check-prod-creds.outputs.available == 'false'
+      - name: No Changes to Deploy
+        if: steps.check-creds.outputs.available == 'true' && steps.delta.outputs.has_changes == 'false'
         run: |
-          echo "ℹ️ PROD deployment skipped - SFDX_AUTH_URL_PROD not configured."
+          echo "ℹ️ No hay cambios en force-app para deployar"
+
+      - name: Deployment Skipped
+        if: steps.check-creds.outputs.available == 'false'
+        run: |
+          echo "ℹ️ PROD deployment skipped - SFDX_AUTH_URL_PROD not configured"

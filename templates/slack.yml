@@ -1,0 +1,117 @@
+name: Slack Notifications
+
+on:
+  push:
+    branches: [master, develop]
+
+jobs:
+  notify:
+    name: Notificar Push
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verificar configuracion de Slack
+        id: check-slack
+        run: |
+          if [ -z "${{ secrets.SLACK_WEBHOOK_URL }}" ]; then
+            echo "configured=false" >> $GITHUB_OUTPUT
+            echo "::warning::SLACK_WEBHOOK_URL no configurado"
+          else
+            echo "configured=true" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Determinar tipo de rama
+        if: steps.check-slack.outputs.configured == 'true'
+        id: details
+        run: |
+          BRANCH="${{ github.ref_name }}"
+          
+          if [ "$BRANCH" = "master" ] || [ "$BRANCH" = "main" ]; then
+            echo "color=#dc3545" >> $GITHUB_OUTPUT
+            echo "emoji=:rotating_light:" >> $GITHUB_OUTPUT
+          else
+            echo "color=#36a64f" >> $GITHUB_OUTPUT
+            echo "emoji=:rocket:" >> $GITHUB_OUTPUT
+          fi
+
+      - name: Enviar notificacion
+        if: steps.check-slack.outputs.configured == 'true'
+        env:
+          SLACK_WEBHOOK_URL: ${{ secrets.SLACK_WEBHOOK_URL }}
+        run: |
+          COMMIT_MSG=$(echo "${{ github.event.head_commit.message }}" | head -c 150 | sed 's/"/\\"/g' | tr '\n' ' ')
+          
+          curl -X POST \
+            -H "Content-type: application/json" \
+            --fail-with-body \
+            --data '{
+              "attachments": [
+                {
+                  "color": "${{ steps.details.outputs.color }}",
+                  "blocks": [
+                    {
+                      "type": "header",
+                      "text": {
+                        "type": "plain_text",
+                        "text": "${{ steps.details.outputs.emoji }} Push en ${{ github.ref_name }}",
+                        "emoji": true
+                      }
+                    },
+                    {
+                      "type": "section",
+                      "fields": [
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Repositorio:*\n${{ github.repository }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Rama:*\n`${{ github.ref_name }}`"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Autor:*\n${{ github.actor }}"
+                        },
+                        {
+                          "type": "mrkdwn",
+                          "text": "*Commit:*\n`${{ github.sha }}`"
+                        }
+                      ]
+                    },
+                    {
+                      "type": "section",
+                      "text": {
+                        "type": "mrkdwn",
+                        "text": "*Mensaje:*\n'"$COMMIT_MSG"'"
+                      }
+                    },
+                    {
+                      "type": "actions",
+                      "elements": [
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": ":memo: Ver Commit",
+                            "emoji": true
+                          },
+                          "url": "${{ github.event.head_commit.url }}",
+                          "style": "primary"
+                        },
+                        {
+                          "type": "button",
+                          "text": {
+                            "type": "plain_text",
+                            "text": ":github: Ver Repositorio",
+                            "emoji": true
+                          },
+                          "url": "${{ github.server_url }}/${{ github.repository }}"
+                        }
+                      ]
+                    }
+                  ]
+                }
+              ]
+            }' \
+            "$SLACK_WEBHOOK_URL"
+          
+          echo "Notificacion enviada"
