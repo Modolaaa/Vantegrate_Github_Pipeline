@@ -179,8 +179,17 @@ function Test-Prerequisites {
     
     # Verificar Salesforce CLI
     if (Test-Command 'sf') {
-        $sfVersion = (sf --version 2>$null | Select-Object -First 1)
-        Write-Success "Salesforce CLI instalado: $sfVersion"
+        try {
+            $sfVersionOutput = sf --version 2>&1
+            $sfVersion = ($sfVersionOutput | Where-Object { $_ -match '@salesforce/cli' } | Select-Object -First 1)
+            if (-not $sfVersion) {
+                $sfVersion = ($sfVersionOutput | Select-Object -First 1)
+            }
+            Write-Success "Salesforce CLI instalado: $sfVersion"
+        }
+        catch {
+            Write-Success 'Salesforce CLI instalado'
+        }
     }
     else {
         Write-Error 'Salesforce CLI no esta instalado'
@@ -345,6 +354,53 @@ function New-GitHubEnvironment {
     }
 }
 
+function Test-BranchProtectionAvailable {
+    param(
+        [string]$RepoName
+    )
+    
+    # Si es repo público, siempre está disponible
+    if ($Visibility -eq 'public') {
+        return $true
+    }
+    
+    # Para repos privados, verificar el plan de la organización o usuario
+    if ($Organization) {
+        # Verificar plan de la organización
+        try {
+            $orgInfo = gh api "orgs/$Organization" --jq '.plan.name' 2>$null
+            if (-not $orgInfo -or $orgInfo -eq 'free') {
+                Write-Warning 'Repositorio privado en organizacion con plan Free detectado'
+                Write-Info 'Branch protection rules requieren GitHub Team o Enterprise para repos privados'
+                Write-Info 'Mas info: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches'
+                return $false
+            }
+        }
+        catch {
+            Write-Warning 'No se pudo verificar el plan de la organizacion'
+            return $false
+        }
+    }
+    else {
+        # Verificar plan del usuario
+        try {
+            $userPlan = gh api "user" --jq '.plan.name' 2>$null
+            if (-not $userPlan -or $userPlan -eq 'free') {
+                Write-Warning 'Repositorio privado en cuenta con plan Free detectado'
+                Write-Info 'Branch protection rules requieren GitHub Pro para repos privados'
+                Write-Info 'Mas info: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches'
+                return $false
+            }
+        }
+        catch {
+            Write-Warning 'No se pudo verificar el plan del usuario'
+            return $false
+        }
+    }
+    
+    return $true
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # SCRIPT PRINCIPAL
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -372,9 +428,20 @@ try {
     # ───────────────────────────────────────────────────────────────────────────
     Write-Step -Message 'Generando estructura Salesforce' -StepNumber 1
     
-    $sfOutput = sf project generate --name $ProjectName --template standard 2>&1
-    if ($LASTEXITCODE -ne 0) {
-        throw "Error generando proyecto: $sfOutput"
+    # Ejecutar sf project generate (capturar output pero no fallar por warnings)
+    try {
+        $sfOutput = sf project generate --name $ProjectName --template standard 2>&1 | Out-String
+        Write-Host $sfOutput -ForegroundColor Gray
+    }
+    catch {
+        # Ignorar errores aquí, verificaremos si el proyecto se creó
+    }
+    
+    # Verificar que el proyecto se creó correctamente
+    $projectFile = Join-Path -Path $ProjectName -ChildPath 'sfdx-project.json'
+    
+    if (-not (Test-Path $projectFile)) {
+        throw "Error generando proyecto Salesforce: el archivo sfdx-project.json no fue creado"
     }
     
     Set-Location $ProjectName
@@ -647,22 +714,29 @@ try {
     # PASO 11: Esperar workflow y aplicar proteccion
     # ───────────────────────────────────────────────────────────────────────────
     if (-not $SkipBranchProtection) {
-        Write-Step -Message 'Esperando workflow inicial' -StepNumber 11
-        Write-Info 'Necesario para que GitHub reconozca los status checks'
+        Write-Step -Message 'Verificando disponibilidad de branch protection' -StepNumber 11
         
-        Start-Sleep -Seconds 15
-        
-        $workflowOk = Wait-ForWorkflowCompletion -TimeoutSeconds $WaitForWorkflowTimeout
-        
-        if (-not $workflowOk) {
-            Write-Warning 'No se confirmo la ejecucion del workflow'
-            Write-Info 'La proteccion de ramas puede fallar'
+        if (Test-BranchProtectionAvailable -RepoName $ProjectName) {
+            Write-Step -Message 'Esperando workflow inicial' -StepNumber 12
+            Write-Info 'Necesario para que GitHub reconozca los status checks'
+            
+            Start-Sleep -Seconds 15
+            
+            $workflowOk = Wait-ForWorkflowCompletion -TimeoutSeconds $WaitForWorkflowTimeout
+            
+            if (-not $workflowOk) {
+                Write-Warning 'No se confirmo la ejecucion del workflow'
+                Write-Info 'La proteccion de ramas puede fallar'
+            }
+            
+            Write-Step -Message 'Aplicando proteccion de ramas' -StepNumber 13
+            
+            Set-BranchProtection -BranchName 'master' -RepoName $ProjectName -AdminEnforcement $EnforceAdmins -Approvals $RequiredApprovals
+            Set-BranchProtection -BranchName 'develop' -RepoName $ProjectName -AdminEnforcement $EnforceAdmins -Approvals $RequiredApprovals
         }
-        
-        Write-Step -Message 'Aplicando proteccion de ramas' -StepNumber 12
-        
-        Set-BranchProtection -BranchName 'master' -RepoName $ProjectName -AdminEnforcement $EnforceAdmins -Approvals $RequiredApprovals
-        Set-BranchProtection -BranchName 'develop' -RepoName $ProjectName -AdminEnforcement $EnforceAdmins -Approvals $RequiredApprovals
+        else {
+            Write-Info 'Omitiendo proteccion de ramas debido a limitaciones del plan'
+        }
     }
     else {
         Write-Step -Message 'Proteccion de ramas omitida' -StepNumber 11

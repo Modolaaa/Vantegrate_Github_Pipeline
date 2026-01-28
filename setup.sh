@@ -370,6 +370,43 @@ new_github_environment() {
     fi
 }
 
+# Verificar si branch protection está disponible
+# Retorna 0 si está disponible, 1 si no (requiere plan de pago para repos privados)
+check_branch_protection_available() {
+    local repo_name="$1"
+    
+    # Si es repo público, siempre está disponible
+    if [[ "$VISIBILITY" == "public" ]]; then
+        return 0
+    fi
+    
+    # Para repos privados, verificar el plan de la organización o usuario
+    local owner=""
+    if [[ -n "$ORGANIZATION" ]]; then
+        # Verificar plan de la organización
+        local org_plan=$(gh api "orgs/$ORGANIZATION" --jq '.plan.name' 2>/dev/null || echo "")
+        
+        if [[ -z "$org_plan" || "$org_plan" == "free" ]]; then
+            write_warning "Repositorio privado en organizacion con plan Free detectado"
+            write_info "Branch protection rules requieren GitHub Team o Enterprise para repos privados"
+            write_info "Mas info: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches"
+            return 1
+        fi
+    else
+        # Verificar plan del usuario
+        local user_plan=$(gh api "user" --jq '.plan.name' 2>/dev/null || echo "")
+        
+        if [[ -z "$user_plan" || "$user_plan" == "free" ]]; then
+            write_warning "Repositorio privado en cuenta con plan Free detectado"
+            write_info "Branch protection rules requieren GitHub Pro para repos privados"
+            write_info "Mas info: https://docs.github.com/en/repositories/configuring-branches-and-merges-in-your-repository/managing-protected-branches/about-protected-branches"
+            return 1
+        fi
+    fi
+    
+    return 0
+}
+
 # ═══════════════════════════════════════════════════════════════════════════════
 # PARSEO DE ARGUMENTOS
 # ═══════════════════════════════════════════════════════════════════════════════
@@ -727,20 +764,26 @@ EOF
     # PASO 10: Esperar workflow y aplicar protección
     # ───────────────────────────────────────────────────────────────────────────
     if [[ "$SKIP_BRANCH_PROTECTION" == false ]]; then
-        write_step "Esperando workflow inicial" 10
-        write_info "Necesario para que GitHub reconozca los status checks"
+        write_step "Verificando disponibilidad de branch protection" 10
         
-        sleep 15
-        
-        if ! wait_for_workflow_completion "$WAIT_FOR_WORKFLOW_TIMEOUT"; then
-            write_warning "No se confirmo la ejecucion del workflow"
-            write_info "La proteccion de ramas puede fallar"
+        if check_branch_protection_available "$PROJECT_NAME"; then
+            write_step "Esperando workflow inicial" 11
+            write_info "Necesario para que GitHub reconozca los status checks"
+            
+            sleep 15
+            
+            if ! wait_for_workflow_completion "$WAIT_FOR_WORKFLOW_TIMEOUT"; then
+                write_warning "No se confirmo la ejecucion del workflow"
+                write_info "La proteccion de ramas puede fallar"
+            fi
+            
+            write_step "Aplicando proteccion de ramas" 12
+            
+            set_branch_protection "master" "$PROJECT_NAME" "$ENFORCE_ADMINS" "$REQUIRED_APPROVALS"
+            set_branch_protection "develop" "$PROJECT_NAME" "$ENFORCE_ADMINS" "$REQUIRED_APPROVALS"
+        else
+            write_info "Omitiendo proteccion de ramas debido a limitaciones del plan"
         fi
-        
-        write_step "Aplicando proteccion de ramas" 11
-        
-        set_branch_protection "master" "$PROJECT_NAME" "$ENFORCE_ADMINS" "$REQUIRED_APPROVALS"
-        set_branch_protection "develop" "$PROJECT_NAME" "$ENFORCE_ADMINS" "$REQUIRED_APPROVALS"
     else
         write_step "Proteccion de ramas omitida" 10
         write_info "Usar sin --skip-protection para habilitarla"
