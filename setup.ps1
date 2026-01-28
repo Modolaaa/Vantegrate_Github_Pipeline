@@ -3,6 +3,9 @@ param(
     [string]$ProjectName,
     
     [Parameter(Mandatory = $false)]
+    [string]$Organization = '',
+    
+    [Parameter(Mandatory = $false)]
     [string[]]$Collaborators = @(),
     
     [Parameter(Mandatory = $false)]
@@ -33,6 +36,7 @@ param(
 $ErrorActionPreference = 'Stop'
 $script:HasErrors = $false
 $script:StartTime = Get-Date
+$script:ScriptDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 
 # ═══════════════════════════════════════════════════════════════════════════════
 # FUNCIONES DE LOGGING
@@ -59,6 +63,7 @@ function Write-Config {
     
     $configItems = @(
         @('Proyecto', $ProjectName),
+        @('Organizacion', $(if ($Organization) { $Organization } else { 'Personal' })),
         @('Visibilidad', $Visibility),
         @('Rama principal', 'master'),
         @('Colaboradores', $(if ($Collaborators.Count -gt 0) { $Collaborators -join ', ' } else { 'Ninguno' })),
@@ -193,7 +198,7 @@ function Test-Prerequisites {
 
     
     # Verificar templates
-    $templatesPath = Join-Path -Path '..' -ChildPath 'templates'
+    $templatesPath = Join-Path -Path $script:ScriptDir -ChildPath 'templates'
     if (Test-Path $templatesPath) {
         Write-Success 'Directorio templates encontrado'
     }
@@ -380,7 +385,7 @@ try {
     # ───────────────────────────────────────────────────────────────────────────
     Write-Step -Message 'Configurando README.md' -StepNumber 2
     
-    $readmeTemplatePath = Join-Path -Path '..' -ChildPath 'templates' | Join-Path -ChildPath 'README.md'
+    $readmeTemplatePath = Join-Path -Path $script:ScriptDir -ChildPath 'templates' | Join-Path -ChildPath 'README.md'
     
     if (Test-Path $readmeTemplatePath) {
         Copy-Item -Path $readmeTemplatePath -Destination 'README.md' -Force
@@ -492,7 +497,7 @@ try {
     $workflowPath = Join-Path -Path '.github' -ChildPath 'workflows'
     New-Item -Path $workflowPath -ItemType Directory -Force | Out-Null
     
-    $pipelineTemplatePath = Join-Path -Path '..' -ChildPath 'templates' | Join-Path -ChildPath 'pipeline.yml'
+    $pipelineTemplatePath = Join-Path -Path $script:ScriptDir -ChildPath 'templates' | Join-Path -ChildPath 'pipeline.yml'
     
     if (Test-Path $pipelineTemplatePath) {
         Copy-Item -Path $pipelineTemplatePath -Destination (Join-Path -Path $workflowPath -ChildPath 'pipeline.yml') -Force
@@ -504,7 +509,7 @@ try {
     
     # Copiar Slack si esta habilitado
     if ($IncludeSlackIntegration) {
-        $slackTemplatePath = Join-Path -Path '..' -ChildPath 'templates' | Join-Path -ChildPath 'slack.yml'
+        $slackTemplatePath = Join-Path -Path $script:ScriptDir -ChildPath 'templates' | Join-Path -ChildPath 'slack.yml'
         
         if (Test-Path $slackTemplatePath) {
             Copy-Item -Path $slackTemplatePath -Destination (Join-Path -Path $workflowPath -ChildPath 'slack.yml') -Force
@@ -572,8 +577,11 @@ try {
     Write-Step -Message 'Creando repositorio en GitHub' -StepNumber 7
     
     
+    # Determinar nombre del repo (con o sin organizacion)
+    $repoFullName = if ($Organization) { "$Organization/$ProjectName" } else { $ProjectName }
+    
     # Crear repo sin push
-    $repoOutput = gh repo create $ProjectName --$Visibility --source=. --remote=origin 2>&1
+    $repoOutput = gh repo create $repoFullName --$Visibility --source=. --remote=origin 2>&1
     
     if ($LASTEXITCODE -ne 0) {
         Write-Error 'Fallo al crear repositorio en GitHub'
@@ -581,7 +589,8 @@ try {
         throw "Error creando repositorio: $repoOutput"
     }
     
-    Write-Success "Repositorio $Visibility creado en GitHub"
+    $repoLocation = if ($Organization) { "organizacion $Organization" } else { 'cuenta personal' }
+    Write-Success "Repositorio $Visibility creado en $repoLocation"
     
     # Push manual con mejor manejo de errores
     Write-Info 'Subiendo codigo...'
@@ -679,7 +688,7 @@ try {
     Write-Host
     
     # Obtener URL del repositorio
-    $repoOwner = gh api user --jq '.login' 2>$null
+    $repoOwner = if ($Organization) { $Organization } else { gh api user --jq '.login' 2>$null }
     $repoUrl = "https://github.com/$repoOwner/$ProjectName"
     
     $border = [string]::new([char]0x2500, 58)
